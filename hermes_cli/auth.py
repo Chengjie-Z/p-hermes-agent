@@ -77,6 +77,18 @@ QWEN_OAUTH_CLIENT_ID = "f0304373b74a44d2b584a3fb70ca9e56"
 QWEN_OAUTH_TOKEN_URL = "https://chat.qwen.ai/api/v1/oauth2/token"
 QWEN_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
 
+_CODEX_REFRESH_DIAG = threading.local()
+
+
+def _set_codex_refresh_diag(event: str) -> None:
+    _CODEX_REFRESH_DIAG.event = event
+
+
+def _consume_codex_refresh_diag() -> str:
+    event = getattr(_CODEX_REFRESH_DIAG, "event", "")
+    _CODEX_REFRESH_DIAG.event = ""
+    return event if isinstance(event, str) else ""
+
 
 # =============================================================================
 # Provider Registry
@@ -1206,6 +1218,18 @@ def get_qwen_auth_status() -> Dict[str, Any]:
         }
 
 
+def _codex_access_token_has_exp(access_token: Any) -> bool:
+    claims = _decode_jwt_claims(access_token)
+    return isinstance(claims.get("exp"), (int, float))
+
+
+def _codex_last_refresh_is_stale(last_refresh: Any, max_age_seconds: int) -> bool:
+    ts = _parse_iso_timestamp(last_refresh)
+    if ts is None:
+        return True
+    return (time.time() - ts) >= max(0, int(max_age_seconds))
+
+
 # =============================================================================
 # SSH / remote session detection
 # =============================================================================
@@ -1384,15 +1408,76 @@ def _refresh_codex_auth_tokens(
     
     Saves the new tokens to Hermes auth store automatically.
     """
-    refreshed = refresh_codex_oauth_pure(
-        str(tokens.get("access_token", "") or ""),
-        str(tokens.get("refresh_token", "") or ""),
-        timeout_seconds=timeout_seconds,
-    )
+    attempted_access = str(tokens.get("access_token", "") or "").strip()
+    attempted_refresh = str(tokens.get("refresh_token", "") or "").strip()
+    try:
+        refreshed = refresh_codex_oauth_pure(
+            attempted_access,
+            attempted_refresh,
+            timeout_seconds=timeout_seconds,
+        )
+    except AuthError as exc:
+        # Auto-recover from refresh token rotation races when another client
+        # (Codex CLI / VS Code) has already advanced the session.
+        if exc.code == "refresh_token_reused":
+            try:
+                latest_data = _read_codex_tokens(_lock=False)
+                latest_tokens = dict(latest_data.get("tokens") or {})
+            except Exception:
+                latest_tokens = {}
+
+            latest_access = str(latest_tokens.get("access_token", "") or "").strip()
+            latest_refresh = str(latest_tokens.get("refresh_token", "") or "").strip()
+            has_newer_local_tokens = bool(
+                latest_access
+                and latest_refresh
+                and (latest_access != attempted_access or latest_refresh != attempted_refresh)
+            )
+            if has_newer_local_tokens:
+                if not _codex_access_token_is_expiring(latest_access, 0):
+                    _set_codex_refresh_diag("reuse_adopt_local")
+                    logger.warning(
+                        "Codex refresh token reused; adopting newer token pair from Hermes auth store."
+                    )
+                    return latest_tokens
+                try:
+                    refreshed_latest = refresh_codex_oauth_pure(
+                        latest_access,
+                        latest_refresh,
+                        timeout_seconds=timeout_seconds,
+                    )
+                    updated_latest = dict(latest_tokens)
+                    updated_latest["access_token"] = refreshed_latest["access_token"]
+                    updated_latest["refresh_token"] = refreshed_latest["refresh_token"]
+                    _save_codex_tokens(updated_latest)
+                    _set_codex_refresh_diag("reuse_refresh_local")
+                    logger.warning(
+                        "Codex refresh token reused; refreshed newer token pair from Hermes auth store."
+                    )
+                    return updated_latest
+                except AuthError as retry_exc:
+                    logger.debug(
+                        "Retrying Codex refresh with newer local token pair failed: %s", retry_exc
+                    )
+
+            cli_tokens = _import_codex_cli_tokens()
+            if cli_tokens:
+                recovered_tokens = dict(tokens)
+                recovered_tokens["access_token"] = str(cli_tokens.get("access_token", "") or "").strip()
+                recovered_tokens["refresh_token"] = str(cli_tokens.get("refresh_token", "") or "").strip()
+                if recovered_tokens["access_token"] and recovered_tokens["refresh_token"]:
+                    _set_codex_refresh_diag("reuse_import_cli")
+                    logger.warning(
+                        "Codex refresh token reused; recovered session from Codex CLI token store."
+                    )
+                    _save_codex_tokens(recovered_tokens)
+                    return recovered_tokens
+        raise
     updated_tokens = dict(tokens)
     updated_tokens["access_token"] = refreshed["access_token"]
     updated_tokens["refresh_token"] = refreshed["refresh_token"]
 
+    _set_codex_refresh_diag("oauth_refresh")
     _save_codex_tokens(updated_tokens)
     return updated_tokens
 
@@ -1438,6 +1523,10 @@ def resolve_codex_runtime_credentials(
     refresh_skew_seconds: int = CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
 ) -> Dict[str, Any]:
     """Resolve runtime credentials from Hermes's own Codex token store."""
+    refresh_max_age_seconds = int(
+        os.getenv("HERMES_CODEX_REFRESH_MAX_AGE_SECONDS", "1800")
+    )
+
     try:
         data = _read_codex_tokens()
     except AuthError as orig_err:
@@ -1461,9 +1550,22 @@ def resolve_codex_runtime_credentials(
     access_token = str(tokens.get("access_token", "") or "").strip()
     refresh_timeout_seconds = float(os.getenv("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", "20"))
 
+    refresh_reason = "none"
     should_refresh = bool(force_refresh)
+    if force_refresh:
+        refresh_reason = "forced"
     if (not should_refresh) and refresh_if_expiring:
         should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
+        if should_refresh:
+            refresh_reason = "expiring_access_token"
+    if (not should_refresh) and refresh_if_expiring and not _codex_access_token_has_exp(access_token):
+        should_refresh = _codex_last_refresh_is_stale(
+            data.get("last_refresh"),
+            refresh_max_age_seconds,
+        )
+        if should_refresh:
+            refresh_reason = "stale_last_refresh_for_opaque_token"
+    refresh_result = "not_needed"
     if should_refresh:
         # Re-read under lock to avoid racing with other Hermes processes
         with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
@@ -1474,10 +1576,25 @@ def resolve_codex_runtime_credentials(
             should_refresh = bool(force_refresh)
             if (not should_refresh) and refresh_if_expiring:
                 should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
+                if should_refresh and refresh_reason == "none":
+                    refresh_reason = "expiring_access_token"
+            if (not should_refresh) and refresh_if_expiring and not _codex_access_token_has_exp(access_token):
+                should_refresh = _codex_last_refresh_is_stale(
+                    data.get("last_refresh"),
+                    refresh_max_age_seconds,
+                )
+                if should_refresh and refresh_reason == "none":
+                    refresh_reason = "stale_last_refresh_for_opaque_token"
 
             if should_refresh:
                 tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
                 access_token = str(tokens.get("access_token", "") or "").strip()
+                refresh_result = _consume_codex_refresh_diag() or "refreshed"
+                logger.info(
+                    "Codex credential refresh completed (reason=%s, result=%s).",
+                    refresh_reason,
+                    refresh_result,
+                )
 
     base_url = (
         os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
@@ -1491,6 +1608,8 @@ def resolve_codex_runtime_credentials(
         "source": "hermes-auth-store",
         "last_refresh": data.get("last_refresh"),
         "auth_mode": "chatgpt",
+        "refresh_reason": refresh_reason,
+        "refresh_result": refresh_result,
     }
 
 

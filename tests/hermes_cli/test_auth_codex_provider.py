@@ -12,6 +12,7 @@ from hermes_cli.auth import (
     AuthError,
     DEFAULT_CODEX_BASE_URL,
     PROVIDER_REGISTRY,
+    _refresh_codex_auth_tokens,
     _read_codex_tokens,
     _save_codex_tokens,
     _import_codex_cli_tokens,
@@ -22,8 +23,16 @@ from hermes_cli.auth import (
 )
 
 
-def _setup_hermes_auth(hermes_home: Path, *, access_token: str = "access", refresh_token: str = "refresh"):
+def _setup_hermes_auth(
+    hermes_home: Path,
+    *,
+    access_token: str = "access",
+    refresh_token: str = "refresh",
+    last_refresh: str | None = None,
+):
     """Write Codex tokens into the Hermes auth store."""
+    if last_refresh is None:
+        last_refresh = "2099-01-01T00:00:00Z"
     hermes_home.mkdir(parents=True, exist_ok=True)
     auth_store = {
         "version": 1,
@@ -34,7 +43,7 @@ def _setup_hermes_auth(hermes_home: Path, *, access_token: str = "access", refre
                     "access_token": access_token,
                     "refresh_token": refresh_token,
                 },
-                "last_refresh": "2026-02-26T00:00:00Z",
+                "last_refresh": last_refresh,
                 "auth_mode": "chatgpt",
             },
         },
@@ -126,6 +135,95 @@ def test_resolve_provider_explicit_codex_does_not_fallback(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     assert resolve_provider("openai-codex") == "openai-codex"
+
+
+def test_refresh_codex_auth_tokens_recovers_from_refresh_token_reused(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    codex_home = tmp_path / "codex-cli"
+    _setup_hermes_auth(hermes_home, access_token="old-access", refresh_token="old-refresh")
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (codex_home / "auth.json").write_text(json.dumps({
+        "tokens": {"access_token": "cli-access", "refresh_token": "cli-refresh"},
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    def _fake_refresh(*_args, **_kwargs):
+        raise AuthError(
+            "refresh token reused",
+            provider="openai-codex",
+            code="refresh_token_reused",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_codex_oauth_pure", _fake_refresh)
+
+    resolved = _refresh_codex_auth_tokens(
+        {"access_token": "old-access", "refresh_token": "old-refresh"},
+        timeout_seconds=5.0,
+    )
+    assert resolved["access_token"] == "cli-access"
+    assert resolved["refresh_token"] == "cli-refresh"
+
+    persisted = _read_codex_tokens()
+    assert persisted["tokens"]["access_token"] == "cli-access"
+    assert persisted["tokens"]["refresh_token"] == "cli-refresh"
+
+
+def test_refresh_codex_auth_tokens_prefers_newer_local_tokens_after_reuse(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    future_token = _jwt_with_exp(int(time.time()) + 3600)
+    _setup_hermes_auth(
+        hermes_home,
+        access_token=future_token,
+        refresh_token="newer-refresh",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    def _fake_refresh(*_args, **_kwargs):
+        raise AuthError(
+            "refresh token reused",
+            provider="openai-codex",
+            code="refresh_token_reused",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_codex_oauth_pure", _fake_refresh)
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+
+    resolved = _refresh_codex_auth_tokens(
+        {"access_token": "old-access", "refresh_token": "old-refresh"},
+        timeout_seconds=5.0,
+    )
+    assert resolved["access_token"] == future_token
+    assert resolved["refresh_token"] == "newer-refresh"
+
+
+def test_resolve_codex_runtime_credentials_refreshes_opaque_tokens_when_last_refresh_stale(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_auth(
+        hermes_home,
+        access_token="opaque-access-token",
+        refresh_token="refresh-old",
+        last_refresh="2020-01-01T00:00:00Z",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("HERMES_CODEX_REFRESH_MAX_AGE_SECONDS", "60")
+
+    called = {"count": 0}
+
+    def _fake_refresh(tokens, timeout_seconds):
+        called["count"] += 1
+        assert timeout_seconds > 0
+        return {"access_token": "access-from-refresh", "refresh_token": "refresh-from-refresh"}
+
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+
+    resolved = resolve_codex_runtime_credentials()
+    assert called["count"] == 1
+    assert resolved["api_key"] == "access-from-refresh"
 
 
 def test_save_codex_tokens_roundtrip(tmp_path, monkeypatch):

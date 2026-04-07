@@ -4304,6 +4304,7 @@ class AIAgent:
             creds = resolve_codex_runtime_credentials(force_refresh=force)
         except Exception as exc:
             logger.debug("Codex credential refresh failed: %s", exc)
+            self._last_codex_refresh_details = {"ok": False, "error": str(exc)}
             return False
 
         api_key = creds.get("api_key")
@@ -4321,6 +4322,21 @@ class AIAgent:
         if not self._replace_primary_openai_client(reason="codex_credential_refresh"):
             return False
 
+        refresh_reason = str(creds.get("refresh_reason", "unknown"))
+        refresh_result = str(creds.get("refresh_result", "unknown"))
+        refresh_source = str(creds.get("source", "unknown"))
+        self._last_codex_refresh_details = {
+            "ok": True,
+            "reason": refresh_reason,
+            "result": refresh_result,
+            "source": refresh_source,
+        }
+        logger.info(
+            "Codex runtime credentials refreshed (reason=%s, result=%s, source=%s)",
+            refresh_reason,
+            refresh_result,
+            refresh_source,
+        )
         return True
 
     def _try_refresh_nous_client_credentials(self, *, force: bool = True) -> bool:
@@ -8481,7 +8497,13 @@ class AIAgent:
                     ):
                         codex_auth_retry_attempted = True
                         if self._try_refresh_codex_client_credentials(force=True):
-                            self._vprint(f"{self.log_prefix}🔐 Codex auth refreshed after 401. Retrying request...")
+                            _refresh_details = getattr(self, "_last_codex_refresh_details", {}) or {}
+                            _refresh_reason = _refresh_details.get("reason", "unknown")
+                            _refresh_result = _refresh_details.get("result", "unknown")
+                            self._vprint(
+                                f"{self.log_prefix}🔐 Codex auth refreshed after 401 "
+                                f"(reason={_refresh_reason}, result={_refresh_result}). Retrying request..."
+                            )
                             continue
                     if (
                         self.api_mode == "chat_completions"
